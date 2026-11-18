@@ -144,6 +144,31 @@
     </div>
     <div class="hint" id="solveHint"></div>
   </section>
+
+  <!-- 高株数量区间分析 -->
+  <section class="card hidden" id="analysisCard">
+    <h2>3. 高株数量区间分析（基于当前已证最优修复）</h2>
+    <div class="row">
+      <div class="field">
+        <label>允许品种</label>
+        <select id="anaVariety"></select>
+      </div>
+      <div class="field">
+        <label>株高阈值（株高 ≥ 阈值 计为高株）</label>
+        <input type="text" id="anaThreshold" placeholder="如 45" />
+      </div>
+      <button id="anaBtn">开始分析</button>
+    </div>
+    <div class="alert" id="anaAlert"></div>
+    <div id="anaResult" style="margin-top:12px;"></div>
+    <div class="hint">
+      在所有满足「同株品种一致、同托盘温室一致、允许组合、核实值锁定」的<b>整表最优方案</b>中，
+      统计「修复后品种 = 所选品种 且 株高 ≥ 阈值」的原表行数，给出已证明的最小/最大值及达到两端的行号；
+      不会把逐格可选值拼成不存在的表。<br/>
+      任一端未证极值、或当前没有已证最优方案时显示<b>不可判定</b>，不发布确定区间；
+      核实值一旦变化，旧区间立即失效，需重新分析。
+    </div>
+  </section>
 </main>
 
 <script>
@@ -158,6 +183,9 @@ let pairs = [];
 let session = null;
 let pollTimer = null;
 let lastSeenRevision = 0;
+let analysis = null;          // 最近一次从后端取回的分析结果
+let analysisInvalidated = false; // 曾有区间但核实值已变化
+let anaPoll = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -222,9 +250,14 @@ async function loadSession(sid) {
   const data = await r.json();
   // 迟到结果保护：若期间已看到更新的 revision，则不渲染旧响应。
   if (session && data.id === session.id && data.revision < lastSeenRevision) return;
+  if (!session || session.id !== data.id) {
+    // 切换会话：清空分析状态
+    analysis = null; analysisInvalidated = false; stopAnalysisPolling();
+  }
   session = data;
   lastSeenRevision = Math.max(lastSeenRevision, data.revision);
   renderSession();
+  await loadAnalysis();
 }
 
 function renderSession() {
@@ -374,6 +407,112 @@ $("confirmBtn").onclick = async () => {
 $("downloadBtn").onclick = () => {
   window.location.href = `/api/sessions/${session.id}/download`;
 };
+
+// ---------- 高株数量区间分析 ----------
+async function loadAnalysis() {
+  if (!session) return;
+  const r = await fetch(`/api/sessions/${session.id}/analysis`);
+  if (!r.ok) return;
+  const a = await r.json();
+  // 迟到响应保护：响应对应的会话版本落后于已知版本时忽略
+  const respRev = a.current_revision !== undefined ? a.current_revision : a.revision;
+  if (respRev !== undefined && respRev < lastSeenRevision) return;
+  if (a.status === "none") {
+    // 后端已清除旧区间（核实值变化）：若此前持有区间则标记失效
+    if (analysis && analysis.revision !== session.revision) analysisInvalidated = true;
+    analysis = null;
+  } else {
+    analysisInvalidated = false;
+    analysis = a;
+  }
+  renderAnalysis();
+  if (analysis && (analysis.status === "pending" || analysis.status === "running")) {
+    startAnalysisPolling();
+  }
+}
+
+function renderAnalysis() {
+  const card = $("analysisCard");
+  if (!session) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  // 品种下拉（保持已选项）
+  const sel = $("anaVariety");
+  const cur = sel.value;
+  const vars = [...new Set(session.allowed_pairs.map(p => p.variety))];
+  sel.innerHTML = vars.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  if (vars.includes(cur)) sel.value = cur;
+
+  const box = $("anaResult");
+  const a = analysis;
+  const invalidMsg = `<div class="alert info" style="display:block">核实值已变化，旧区间已失效。请重新「开始分析」。</div>`;
+  if (!a) {
+    box.innerHTML = analysisInvalidated
+      ? invalidMsg
+      : `<div class="hint">尚未分析：选择品种与株高阈值后点击「开始分析」。</div>`;
+    return;
+  }
+  if (a.revision !== session.revision) { box.innerHTML = invalidMsg; return; }
+  if (a.status === "pending" || a.status === "running") {
+    box.innerHTML = `<div class="alert info" style="display:block">分析中 <span class="spinner"></span>（期间修改核实值会使本次分析作废）</div>`;
+    return;
+  }
+  if (a.status === "done") {
+    const fmt = rows => (rows && rows.length) ? rows.map(esc).join("、") : "（无）";
+    box.innerHTML = `<div class="conflict-box" style="border-color:#bbf7d0;background:var(--green-bg);color:var(--green);">
+      品种 <b>${esc(a.variety)}</b> 且株高 ≥ <b>${a.threshold}</b> 的原表行数
+      （基于 rev ${a.revision} 已证最优修复，遍历全部整表最优方案）：<br/>
+      最少 <b>${a.min_count}</b> 行，达到行号：${fmt(a.min_rows)}<br/>
+      最多 <b>${a.max_count}</b> 行，达到行号：${fmt(a.max_rows)}</div>`;
+    return;
+  }
+  if (a.status === "undecidable") {
+    box.innerHTML = `<div class="conflict-box"><b>不可判定</b>：${esc(a.reason || "无法证明区间端点，按规则不发布确定区间。")}</div>`;
+    return;
+  }
+  if (a.status === "error") {
+    box.innerHTML = `<div class="conflict-box">分析失败：${esc(a.error || "未知错误")}。原表与核实值未受影响，可重试。</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="alert info" style="display:block">该分析请求已被更新的请求取代。</div>`;
+}
+
+$("anaBtn").onclick = async () => {
+  showAlert($("anaAlert"), "");
+  const variety = $("anaVariety").value;
+  const raw = $("anaThreshold").value.trim();
+  const threshold = Number(raw);
+  if (!variety) { showAlert($("anaAlert"), "请选择品种。"); return; }
+  if (raw === "" || !Number.isFinite(threshold)) {
+    showAlert($("anaAlert"), "株高阈值必须是有限数值（拒绝 NaN/Inf）。"); return;
+  }
+  $("anaBtn").disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${session.id}/analysis`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variety, threshold }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      const detail = Array.isArray(body.detail) ? body.detail.map(e => e.msg).join("；") : body.detail;
+      showAlert($("anaAlert"), detail || "分析请求被拒绝");
+      return;
+    }
+    await loadAnalysis();
+  } finally {
+    $("anaBtn").disabled = false;
+  }
+};
+
+function startAnalysisPolling() {
+  if (anaPoll) return;
+  anaPoll = setInterval(async () => {
+    await loadAnalysis();
+    if (!analysis || (analysis.status !== "pending" && analysis.status !== "running")) {
+      stopAnalysisPolling();
+    }
+  }, 800);
+}
+function stopAnalysisPolling() { if (anaPoll) { clearInterval(anaPoll); anaPoll = null; } }
 
 // ---------- 轮询（迟到响应不替换新方案由后端版本控制 + 前端 revision 保护） ----------
 function startPolling(sid) {

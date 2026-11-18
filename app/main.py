@@ -1,8 +1,9 @@
-"""FastAPI 应用：上传、锁定/解锁、求解作业、确认、下载。"""
+"""FastAPI 应用：上传、锁定/解锁、求解作业、确认、下载、高株区间分析。"""
 from __future__ import annotations
 
 import csv
 import io
+import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,8 +20,8 @@ from .parsing import (
     parse_inspection_csv,
     validate_allowed_dims,
 )
-from .schemas import AllowedPairsPayload, LockIn
-from .solver import LockSpec, solve
+from .schemas import AllowedPairsPayload, AnalysisIn, LockIn
+from .solver import LockSpec, solve, tall_count_bounds
 
 
 # 串行后台求解器：单线程保证求解作业按序执行，作业内部自行做版本检查。
@@ -41,7 +42,8 @@ async def lifespan(app: FastAPI):
     _job_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="solver")
     db.init_db()
     yield
-    _job_pool.shutdown(wait=False)
+    # 等待在途作业结束，避免关闭后线程再写库（测试间/进程退出时串库）
+    _job_pool.shutdown(wait=True)
     _job_pool = None
 
 
@@ -323,6 +325,140 @@ def download_csv(sid: int) -> Response:
             )
         },
     )
+
+
+# ---------------------------------------------------------------- 高株区间分析
+@app.post("/api/sessions/{sid}/analysis")
+def start_analysis(sid: int, body: AnalysisIn) -> dict:
+    """发起高株行数区间分析（基于当前已证最优修复，遍历全部整表最优方案）。
+
+    株高或阈值非有限、品种不在允许域内时拒绝此次分析，原会话不受任何影响。
+    """
+    data = db.get_session(sid)
+    if data is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+    varieties = {v for v, _ in data["pairs"]}
+    if body.variety not in varieties:
+        raise HTTPException(
+            status_code=400,
+            detail=f"品种「{body.variety}」不在允许组合取值域内。",
+        )
+    threshold = float(body.threshold)
+    if not math.isfinite(threshold):  # FiniteFloat 之外的兜底
+        raise HTTPException(status_code=400, detail="株高阈值必须是有限数值。")
+    for r in data["rows"]:
+        try:
+            h = float(r["height"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {r['row_id']} 行株高「{r['height']}」不是数值，拒绝此次分析。",
+            ) from None
+        if not math.isfinite(h):
+            raise HTTPException(
+                status_code=400,
+                detail=f"第 {r['row_id']} 行株高「{r['height']}」不是有限数值，拒绝此次分析。",
+            )
+    revision = data["session"]["revision"]
+    analysis_id = db.create_analysis(sid, revision, body.variety, threshold)
+    _pool().submit(_run_analysis, sid, analysis_id, revision, body.variety, threshold)
+    return {"analysis_id": analysis_id, "revision": revision, "status": "pending"}
+
+
+@app.get("/api/sessions/{sid}/analysis")
+def latest_analysis(sid: int) -> dict:
+    data = db.get_session(sid)
+    if data is None:
+        raise HTTPException(status_code=404, detail="会话不存在。")
+    current_rev = data["session"]["revision"]
+    a = db.get_latest_analysis(sid)
+    if a is None:
+        # 无分析（或旧区间已随核实值变化被清除）
+        return {"status": "none", "revision": current_rev}
+    return {
+        "id": a["id"],
+        "status": a["status"],
+        "variety": a["variety"],
+        "threshold": a["threshold"],
+        "revision": a["revision"],
+        "current_revision": current_rev,
+        "stale": a["revision"] != current_rev,
+        "min_count": a["min_count"],
+        "max_count": a["max_count"],
+        "min_rows": a["min_rows"],
+        "max_rows": a["max_rows"],
+        "reason": a["reason"],
+        "error": a["error"],
+    }
+
+
+def _run_analysis(
+    sid: int, analysis_id: int, revision: int, variety: str, threshold: float
+) -> None:
+    """后台计算高株行数区间。迟到结果（版本已变/请求被取代）直接丢弃。"""
+    if db.current_revision(sid) != revision:
+        db.supersede_analysis(analysis_id)
+        return
+    db.mark_analysis_running(analysis_id)
+    try:
+        data = db.get_session(sid)
+        if data is None or data["session"]["revision"] != revision:
+            db.supersede_analysis(analysis_id)
+            return
+        solution = db.get_solution(sid)
+        if (
+            solution is None
+            or solution["revision"] != revision
+            or solution["status"] != "optimal"
+            or not solution["objective_proven"]
+            or solution["total_changes"] is None
+        ):
+            db.save_analysis(
+                analysis_id,
+                sid,
+                revision,
+                status="undecidable",
+                reason="当前没有已证明最优的修复方案，无法给出确定区间。",
+            )
+            return
+        locks = [
+            LockSpec(
+                row_id=l["row_id"],
+                fld=l["field"],
+                value=l["value"],
+                source=l["source"],
+            )
+            for l in data["locks"]
+        ]
+        result = tall_count_bounds(
+            data["rows"],
+            data["pairs"],
+            locks,
+            variety,
+            threshold,
+            solution["total_changes"],
+        )
+        if result.status == "ok":
+            db.save_analysis(
+                analysis_id,
+                sid,
+                revision,
+                status="done",
+                min_count=result.min_count,
+                max_count=result.max_count,
+                min_rows=result.min_rows,
+                max_rows=result.max_rows,
+            )
+        else:
+            db.save_analysis(
+                analysis_id,
+                sid,
+                revision,
+                status="undecidable",
+                reason=result.reason,
+            )
+    except Exception as exc:  # 失败不影响原表、核实值与方案
+        db.save_analysis(analysis_id, sid, revision, status="error", error=str(exc))
 
 
 # ---------------------------------------------------------------- 后台作业

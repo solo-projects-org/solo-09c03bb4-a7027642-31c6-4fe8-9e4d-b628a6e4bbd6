@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -29,9 +30,10 @@ def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # 先设 busy 超时再切 WAL：并发初始化/写入时让锁等待生效
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -109,12 +111,39 @@ CREATE TABLE IF NOT EXISTS confirmations (
     created_at TEXT NOT NULL,
     UNIQUE(session_id)
 );
+CREATE TABLE IF NOT EXISTS analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    revision INTEGER NOT NULL,
+    variety TEXT NOT NULL,
+    threshold REAL NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','running','done','undecidable','superseded','error')),
+    min_count INTEGER,
+    max_count INTEGER,
+    min_rows TEXT,
+    max_rows TEXT,
+    reason TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
 """
 
 
 def init_db() -> None:
-    with _write_lock, get_conn() as conn:
-        conn.executescript(SCHEMA)
+    """建表。并发启动/测试切换数据库文件时可能瞬时锁冲突，短暂重试。"""
+    last: Optional[sqlite3.OperationalError] = None
+    for _ in range(50):  # 最多约 10 秒
+        try:
+            with _write_lock, get_conn() as conn:
+                conn.executescript(SCHEMA)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc):
+                raise
+            last = exc
+            time.sleep(0.2)
+    raise last  # type: ignore[misc]
 
 
 def create_session(rows: Sequence[dict], pairs: Sequence[Tuple[str, str]]) -> int:
@@ -189,12 +218,15 @@ def get_session(sid: int) -> Optional[dict]:
 
 
 def bump_revision(sid: int) -> int:
-    """锁定/解锁后调用：版本号 +1，旧确认作废（锁已变，旧方案立即不可确认）。"""
+    """锁定/解锁后调用：版本号 +1，旧确认与旧分析区间立即作废（核实值已变）。"""
     with _write_lock, get_conn() as conn:
         conn.execute(
             "UPDATE sessions SET revision = revision + 1 WHERE id=?", (sid,)
         )
         conn.execute("DELETE FROM confirmations WHERE session_id=?", (sid,))
+        # 核实值变化后旧区间立即失效：删除该会话全部分析结果，
+        # 迟到分析作业的写入由 save_analysis 内的版本核对拦截。
+        conn.execute("DELETE FROM analyses WHERE session_id=?", (sid,))
         rev = conn.execute(
             "SELECT revision FROM sessions WHERE id=?", (sid,)
         ).fetchone()[0]
@@ -345,3 +377,111 @@ def add_confirmation(sid: int, solution_id: int, revision: int) -> None:
             "VALUES (?,?,?,?)",
             (sid, solution_id, revision, _now()),
         )
+
+
+# ---------------------------------------------------------------- 高株区间分析
+def create_analysis(sid: int, revision: int, variety: str, threshold: float) -> int:
+    """登记一次分析请求；同会话未完成的旧请求标记为被取代。"""
+    with _write_lock, get_conn() as conn:
+        conn.execute(
+            "UPDATE analyses SET status='superseded', finished_at=? "
+            "WHERE session_id=? AND status IN ('pending','running')",
+            (_now(), sid),
+        )
+        cur = conn.execute(
+            "INSERT INTO analyses(session_id, revision, variety, threshold, status, created_at)"
+            " VALUES (?,?,?,?, 'pending', ?)",
+            (sid, revision, variety, threshold, _now()),
+        )
+        return cur.lastrowid
+
+
+def mark_analysis_running(analysis_id: int) -> None:
+    with _write_lock, get_conn() as conn:
+        conn.execute(
+            "UPDATE analyses SET status='running' WHERE id=? AND status='pending'",
+            (analysis_id,),
+        )
+
+
+def supersede_analysis(analysis_id: int) -> None:
+    with _write_lock, get_conn() as conn:
+        conn.execute(
+            "UPDATE analyses SET status='superseded', finished_at=? "
+            "WHERE id=? AND status IN ('pending','running')",
+            (_now(), analysis_id),
+        )
+
+
+def save_analysis(
+    analysis_id: int,
+    sid: int,
+    revision: int,
+    *,
+    status: str,
+    min_count: Optional[int] = None,
+    max_count: Optional[int] = None,
+    min_rows: Optional[List[str]] = None,
+    max_rows: Optional[List[str]] = None,
+    reason: Optional[str] = None,
+    error: Optional[str] = None,
+) -> bool:
+    """原子写入分析结果。
+
+    仅当会话修订号仍为 revision 且该分析仍待决（pending/running）时落库；
+    否则（核实值已变、记录已被版本清理、或已被新请求取代）标记 superseded
+    并返回 False——迟到计算绝不替换新版结果。
+    """
+    with _write_lock, get_conn() as conn:
+        rev_row = conn.execute(
+            "SELECT revision FROM sessions WHERE id=?", (sid,)
+        ).fetchone()
+        row = conn.execute(
+            "SELECT status FROM analyses WHERE id=?", (analysis_id,)
+        ).fetchone()
+        if row is None:
+            return False  # 版本变更时已随旧区间一并清除
+        current_rev = rev_row[0] if rev_row else None
+        if current_rev != revision or row["status"] not in ("pending", "running"):
+            if row["status"] in ("pending", "running"):
+                conn.execute(
+                    "UPDATE analyses SET status='superseded', finished_at=? WHERE id=?",
+                    (_now(), analysis_id),
+                )
+            return False
+        conn.execute(
+            """UPDATE analyses
+               SET status=?, min_count=?, max_count=?, min_rows=?, max_rows=?,
+                   reason=?, error=?, finished_at=?
+               WHERE id=?""",
+            (
+                status,
+                min_count,
+                max_count,
+                json.dumps(min_rows, ensure_ascii=False)
+                if min_rows is not None
+                else None,
+                json.dumps(max_rows, ensure_ascii=False)
+                if max_rows is not None
+                else None,
+                reason,
+                error,
+                _now(),
+                analysis_id,
+            ),
+        )
+        return True
+
+
+def get_latest_analysis(sid: int) -> Optional[dict]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM analyses WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["min_rows"] = json.loads(out["min_rows"]) if out["min_rows"] else None
+        out["max_rows"] = json.loads(out["max_rows"]) if out["max_rows"] else None
+        return out

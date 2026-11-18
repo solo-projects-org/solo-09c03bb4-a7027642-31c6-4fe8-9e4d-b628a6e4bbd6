@@ -20,6 +20,7 @@ let state = {
   cells: [],
   conflicts: [],
   groups: [],
+  analysis: null, // null 表示后端无分析记录（status:none）
 };
 function sessionBody() {
   return {
@@ -51,10 +52,12 @@ window.fetch = async (url, opts = {}) => {
         ? { ...c, locked: true, locked_value: body.value, lock_source: body.source, category: "locked" }
         : c);
     state.revision += 1; state.solution_stale = true; state.confirmed = false; state.lockedCount += 1;
+    state.analysis = null; // 核实值变化：旧区间立即失效
     return { ok: true, status: 200, json: async () => ({ revision: state.revision, locked: true }) };
   }
   if (url.match(/locks\/\d+\/\w+$/) && method === "DELETE") {
     state.revision += 1; state.solution_stale = true;
+    state.analysis = null;
     return { ok: true, status: 200, json: async () => ({ revision: state.revision, locked: false }) };
   }
   if (url.endsWith("/solve") && method === "POST") {
@@ -69,6 +72,24 @@ window.fetch = async (url, opts = {}) => {
   }
   if (url.match(/\/api\/sessions\/1$/)) {
     return { ok: true, status: 200, json: async () => sessionBody() };
+  }
+  if (url.endsWith("/analysis") && method === "GET") {
+    const body = state.analysis
+      ? { ...state.analysis, current_revision: state.revision, stale: state.analysis.revision !== state.revision }
+      : { status: "none", revision: state.revision };
+    return { ok: true, status: 200, json: async () => body };
+  }
+  if (url.endsWith("/analysis") && method === "POST") {
+    const body = JSON.parse(opts.body);
+    if (!Number.isFinite(body.threshold)) {
+      return { ok: false, status: 400, json: async () => ({ detail: "株高阈值必须是有限数值。" }) };
+    }
+    state.analysis = {
+      id: 1, status: "done", variety: body.variety, threshold: body.threshold,
+      revision: state.revision, min_count: 1, max_count: 2,
+      min_rows: ["2"], max_rows: ["1", "2"], reason: null, error: null,
+    };
+    return { ok: true, status: 200, json: async () => ({ analysis_id: 1, revision: state.revision, status: "pending" }) };
   }
   throw new Error("unmocked " + method + " " + url);
 };
@@ -106,6 +127,23 @@ const assert = (cond, msg) => { if (!cond) { console.error("FAIL:", msg); proces
   assert(document.getElementById("confirmBtn").disabled === false, "confirm enabled when optimal & fresh");
   assert(document.getElementById("downloadBtn").disabled === true, "download disabled before confirm");
 
+  // 高株区间分析：初始提示 + 非有限阈值前端拦截
+  assert(!document.getElementById("analysisCard").classList.contains("hidden"), "analysis card visible");
+  assert(document.getElementById("anaResult").textContent.includes("尚未分析"), "analysis placeholder shown");
+  document.getElementById("anaThreshold").value = "abc";
+  document.getElementById("anaBtn").click();
+  await new Promise(r => setTimeout(r, 30));
+  assert(document.getElementById("anaAlert").textContent.includes("有限数值"), "non-finite threshold blocked");
+  assert(state.analysis === null, "no analysis started for invalid threshold");
+
+  // 正常分析：渲染两端极值与达到行号
+  document.getElementById("anaThreshold").value = "45";
+  document.getElementById("anaBtn").click();
+  await new Promise(r => setTimeout(r, 50));
+  const anaText = document.getElementById("anaResult").textContent;
+  assert(anaText.includes("最少 1 行") && anaText.includes("最多 2 行"), "interval bounds rendered");
+  assert(anaText.includes("1、2"), "max witness rows rendered");
+
   // 模拟锁定行2品种候选值
   const sel = document.querySelector('select[data-act="lock-candidate"][data-row="2"]');
   sel.value = "V1";
@@ -115,6 +153,8 @@ const assert = (cond, msg) => { if (!cond) { console.error("FAIL:", msg); proces
   assert(document.getElementById("staleBanner").style.display === "block", "stale banner shown");
   assert(document.getElementById("confirmBtn").disabled === true, "confirm blocked when stale");
   assert(document.querySelector(".b-locked").textContent.includes("已锁定"), "locked badge rendered");
+  // 核实值变化后旧区间立即失效
+  assert(document.getElementById("anaResult").textContent.includes("已失效"), "analysis invalidated after lock");
 
   // 重算后过期解除
   state.solution_stale = false;

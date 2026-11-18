@@ -26,6 +26,18 @@ class LockIn(BaseModel):
     source: str = Field("candidate", pattern="^(original|candidate)$")
 
 
+class AnalysisIn(BaseModel):
+    """高株数量区间分析请求。
+
+    threshold 用普通 float 接收（NaN/Inf 也能通过 JSON 解析进来），
+    有限性由端点显式校验并返回 400——若用 FiniteFloat，校验失败时
+    FastAPI 渲染包含 NaN 的错误体会再次抛异常，无法给出干净拒绝。
+    """
+
+    variety: str = Field(..., min_length=1, max_length=64)
+    threshold: float
+
+
 class RowOut(BaseModel):
     row_id: int
     line_no: int

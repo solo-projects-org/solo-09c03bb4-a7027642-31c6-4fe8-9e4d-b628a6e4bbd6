@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -27,6 +28,8 @@ from ortools.sat.python import cp_model
 ENUM_TIME_LIMIT = 10.0
 # 主优化求解的时间预算（秒）。
 OPTIMIZE_TIME_LIMIT = 30.0
+# 高株行数区间分析单方向（最小/最大）的时间预算（秒）。
+TALL_COUNT_TIME_LIMIT = 30.0
 
 
 @dataclass
@@ -77,6 +80,19 @@ class SolveResult:
     conflicts: List[Conflict] = field(default_factory=list)
     groups: List[dict] = field(default_factory=list)
     error: Optional[str] = None
+
+
+@dataclass
+class TallCountResult:
+    """高株行数区间分析结果。status=ok 时两端极值均已证明；否则不可判定。"""
+
+    status: str  # ok | undecidable
+    min_count: Optional[int] = None
+    max_count: Optional[int] = None
+    # 分别达到最小/最大值的那份整表最优方案中，被计入的原表行号（line_no）。
+    min_rows: List[str] = field(default_factory=list)
+    max_rows: List[str] = field(default_factory=list)
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -520,3 +536,118 @@ def _explain_infeasible(
                 )
             )
     return conflicts
+
+
+def tall_count_bounds(
+    rows: Sequence[dict],
+    allowed_pairs: Sequence[Tuple[str, str]],
+    locks: Sequence[LockSpec],
+    variety: str,
+    threshold: float,
+    best_changes: int,
+) -> TallCountResult:
+    """在全部整表最优修复方案上统计高株行数，求已证明的最小/最大值。
+
+    统计口径：某份最优方案中「修复后品种 == variety 且株高 >= threshold」的原表行数。
+    可行域为 总改动 <= best_changes（即全部整表最优方案），同株品种一致、
+    同托盘温室一致、允许组合、锁定值不可改共同成立——对整表联合优化，
+    绝不拼接逐格候选值。两个方向都必须证明最优（CP-SAT OPTIMAL），
+    任一端未证极值即返回 undecidable，不给出确定区间。
+    """
+    varieties = sorted({v for v, _ in allowed_pairs})
+    houses = sorted({h for _, h in allowed_pairs})
+    v_id = {v: i for i, v in enumerate(varieties)}
+    h_id = {h: i for i, h in enumerate(houses)}
+    pair_tuples = [(v_id[v], h_id[h]) for v, h in allowed_pairs]
+
+    if variety not in v_id:
+        return TallCountResult(
+            status="undecidable",
+            reason=f"品种「{variety}」不在允许组合取值域内。",
+        )
+    if not math.isfinite(threshold):
+        return TallCountResult(status="undecidable", reason="株高阈值不是有限数值。")
+
+    lock_by_cell: Dict[Tuple[int, str], LockSpec] = {}
+    for lk in locks:
+        target = v_id if lk.fld == "variety" else h_id
+        if lk.value not in target:
+            return TallCountResult(
+                status="undecidable",
+                reason="存在取值域外的核实值，无法进行分析。",
+            )
+        lock_by_cell[(lk.row_id, lk.fld)] = lk
+
+    tall_rows: List[dict] = []
+    for row in rows:
+        try:
+            h = float(row["height"])
+        except (TypeError, ValueError):
+            return TallCountResult(
+                status="undecidable",
+                reason=f"第 {row['row_id']} 行株高「{row['height']}」不是数值。",
+            )
+        if not math.isfinite(h):
+            return TallCountResult(
+                status="undecidable",
+                reason=f"第 {row['row_id']} 行株高「{row['height']}」不是有限数值。",
+            )
+        if h >= threshold:
+            tall_rows.append(row)
+
+    target = v_id[variety]
+
+    def _optimize(maximize: bool) -> Optional[Tuple[int, List[str]]]:
+        """在全部最优方案上最小化/最大化高株行数；未证最优返回 None。"""
+        try:
+            art = _build_model(
+                rows,
+                pair_tuples,
+                v_id,
+                h_id,
+                lock_by_cell,
+                with_objective=False,
+                bound=best_changes,
+            )
+        except _InfeasibleStructure:
+            return None
+        model = art.model
+        bools: List[Tuple[str, cp_model.IntVar]] = []
+        for row in tall_rows:
+            b = model.NewBoolVar(f"tall_{row['row_id']}")
+            vv = art.variety_vars[row["plant_no"]]
+            model.Add(vv == target).OnlyEnforceIf(b)
+            model.Add(vv != target).OnlyEnforceIf(b.Not())
+            bools.append((row["line_no"], b))
+        count = model.NewIntVar(0, len(tall_rows), "tall_count")
+        model.Add(count == sum(b for _, b in bools))
+        if maximize:
+            model.Maximize(count)
+        else:
+            model.Minimize(count)
+        solver = cp_model.CpSolver()
+        solver.parameters.random_seed = 20261116
+        solver.parameters.num_search_workers = 8
+        solver.parameters.max_time_in_seconds = TALL_COUNT_TIME_LIMIT
+        status = solver.Solve(model)
+        if status != cp_model.OPTIMAL:
+            # 超时/未知/异常：极值未证明，不得发布。
+            return None
+        return int(round(solver.ObjectiveValue())), [
+            line_no for line_no, b in bools if solver.Value(b) == 1
+        ]
+
+    lo = _optimize(maximize=False)
+    hi = _optimize(maximize=True)
+    if lo is None or hi is None:
+        return TallCountResult(
+            status="undecidable",
+            reason="未能在时限内证明高株行数的极值，按规则不发布确定区间。",
+        )
+    return TallCountResult(
+        status="ok",
+        min_count=lo[0],
+        max_count=hi[0],
+        min_rows=lo[1],
+        max_rows=hi[1],
+    )
